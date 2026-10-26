@@ -291,7 +291,8 @@ impl FcmClient {
                 if let Some(details) = detail.details {
                     for item in details {
                         if item.error_code.as_deref() == Some("UNREGISTERED")
-                            || (validate_only && item.error_code.as_deref() == Some("INVALID_ARGUMENT"))
+                            || (validate_only
+                                && item.error_code.as_deref() == Some("INVALID_ARGUMENT"))
                         {
                             return Err(FcmError::Unregistered);
                         }
