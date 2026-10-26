@@ -194,12 +194,17 @@ impl FcmClient {
         &self,
         fcm_token: &str,
         channel_id: Uuid,
+        version: Option<&str>,
         data_payload: Option<&str>,
         headers: Option<&HashMap<String, String>>,
     ) -> Result<(), FcmError> {
         let mut data = HashMap::new();
         data.insert("type".to_string(), "notification".to_string());
         data.insert("channel_id".to_string(), channel_id.to_string());
+
+        if let Some(ver) = version {
+            data.insert("version".to_string(), ver.to_string());
+        }
 
         if let Some(payload) = data_payload {
             data.insert("data".to_string(), payload.to_string());
@@ -278,7 +283,7 @@ impl FcmClient {
             if let Some(detail) = err_resp.error {
                 if detail.code == Some(404)
                     || detail.status.as_deref() == Some("NOT_FOUND")
-                    || detail.status.as_deref() == Some("INVALID_ARGUMENT")
+                    || (validate_only && detail.status.as_deref() == Some("INVALID_ARGUMENT"))
                 {
                     return Err(FcmError::Unregistered);
                 }
@@ -286,7 +291,7 @@ impl FcmClient {
                 if let Some(details) = detail.details {
                     for item in details {
                         if item.error_code.as_deref() == Some("UNREGISTERED")
-                            || item.error_code.as_deref() == Some("INVALID_ARGUMENT")
+                            || (validate_only && item.error_code.as_deref() == Some("INVALID_ARGUMENT"))
                         {
                             return Err(FcmError::Unregistered);
                         }
@@ -301,7 +306,7 @@ impl FcmClient {
             }
         }
 
-        if status.as_u16() == 404 || status.as_u16() == 400 {
+        if status.as_u16() == 404 || (validate_only && status.as_u16() == 400) {
             return Err(FcmError::Unregistered);
         }
 

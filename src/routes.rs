@@ -91,8 +91,7 @@ pub fn create_router(state: AppState) -> Router {
 async fn healthz(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
-    sqlx::query("SELECT 1")
-        .execute(&state.db)
+    crate::db::check_health(&state.db)
         .await
         .map_err(|_| (StatusCode::SERVICE_UNAVAILABLE, "Database unavailable"))?;
 

@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
                 .context("Failed to start Autopush connection pool")?;
 
             let app_state = AppState {
-                pool: autopush_pool,
+                pool: Arc::clone(&autopush_pool),
                 db: pool.clone(),
             };
 
@@ -94,6 +94,8 @@ async fn main() -> Result<()> {
                 .with_graceful_shutdown(shutdown_signal())
                 .await
                 .context("Server error")?;
+
+            autopush_pool.shutdown_all().await;
 
             info!("Server shut down gracefully.");
         }

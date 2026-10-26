@@ -3,8 +3,8 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
-    sync::{mpsc, oneshot, RwLock},
-    time::{interval, sleep},
+    sync::{mpsc, oneshot, Mutex, RwLock},
+    time::{interval, sleep, timeout},
 };
 use tokio_tungstenite::{
     connect_async,
@@ -96,6 +96,7 @@ pub struct AutopushPool {
     db_pool: sqlx::PgPool,
     fcm_client: Arc<FcmClient>,
     workers: Arc<RwLock<HashMap<String, mpsc::Sender<WorkerCommand>>>>,
+    alloc_mutex: Mutex<()>,
 }
 
 impl AutopushPool {
@@ -105,6 +106,7 @@ impl AutopushPool {
             db_pool,
             fcm_client,
             workers: Arc::new(RwLock::new(HashMap::new())),
+            alloc_mutex: Mutex::new(()),
         }
     }
 
@@ -138,6 +140,17 @@ impl AutopushPool {
         Ok(())
     }
 
+    pub async fn shutdown_all(&self) {
+        let mut workers = self.workers.write().await;
+        info!(
+            "Shutting down {} active Autopush WebSocket worker(s)...",
+            workers.len()
+        );
+        for (_, tx) in workers.drain() {
+            let _ = tx.send(WorkerCommand::Shutdown).await;
+        }
+    }
+
     pub async fn register_channel(
         self: &Arc<Self>,
         fcm_token: &str,
@@ -148,6 +161,10 @@ impl AutopushPool {
             .validate_token(fcm_token)
             .await
             .map_err(|e| anyhow!("FCM token validation failed: {e}"))?;
+
+        // Serialize session candidate selection, registration, and channel DB insertion
+        // to avoid race conditions with concurrent registrations or empty-session cleanup.
+        let _alloc_guard = self.alloc_mutex.lock().await;
 
         // 2. Find candidate UAID or spawn new one
         let mut target_uaid =
@@ -184,11 +201,20 @@ impl AutopushPool {
         .await
         .map_err(|_| anyhow!("Failed to send register command to worker for UAID {uaid}"))?;
 
-        let push_endpoint = tokio::time::timeout(Duration::from_secs(15), resp_rx)
+        let reg_res = timeout(Duration::from_secs(15), resp_rx)
             .await
-            .map_err(|_| anyhow!("Timed out waiting for Autopush registration"))?
-            .map_err(|_| anyhow!("Worker dropped response channel"))?
-            .map_err(|err_msg| anyhow!("Autopush registration failed: {err_msg}"))?;
+            .map_err(|_| anyhow!("Timed out waiting for Autopush registration"))
+            .and_then(|r| r.map_err(|_| anyhow!("Worker dropped response channel")))
+            .and_then(|r| r.map_err(|err_msg| anyhow!("Autopush registration failed: {err_msg}")));
+
+        let push_endpoint = match reg_res {
+            Ok(ep) => ep,
+            Err(e) => {
+                // If this was a newly created session with 0 channels and registration failed, clean it up
+                self.shutdown_worker_if_empty(&uaid).await;
+                return Err(e);
+            }
+        };
 
         // 4. Save to DB
         db::insert_channel(
@@ -207,20 +233,19 @@ impl AutopushPool {
     }
 
     pub async fn unregister_channel(&self, channel_id: Uuid) -> Result<()> {
+        let _alloc_guard = self.alloc_mutex.lock().await;
+
         let uaid_opt = db::delete_channel(&self.db_pool, channel_id).await?;
         if let Some(uaid) = uaid_opt {
-            let workers = self.workers.read().await;
-            if let Some(tx) = workers.get(&uaid) {
-                let _ = tx.send(WorkerCommand::Unregister { channel_id }).await;
+            {
+                let workers = self.workers.read().await;
+                if let Some(tx) = workers.get(&uaid) {
+                    let _ = tx.send(WorkerCommand::Unregister { channel_id }).await;
+                }
             }
-            drop(workers);
 
-            // Check if remaining channels count is 0
-            let remaining = db::count_channels_by_uaid(&self.db_pool, &uaid).await?;
-            if remaining == 0 {
-                info!("UAID {uaid} has 0 channels remaining. Shutting down worker.");
-                self.shutdown_worker(&uaid).await;
-            }
+            // Atomically delete session if 0 channels remain, and shut down worker if deleted
+            self.shutdown_worker_if_empty(&uaid).await;
         }
         Ok(())
     }
@@ -239,7 +264,17 @@ impl AutopushPool {
         db::sync_channels(&self.db_pool, fcm_token, channel_ids).await
     }
 
-    async fn shutdown_worker(&self, uaid: &str) {
+    async fn shutdown_worker_if_empty(&self, uaid: &str) {
+        if let Ok(true) = db::delete_session_if_empty(&self.db_pool, uaid).await {
+            info!("UAID {uaid} has 0 channels remaining. Shutting down worker.");
+            let mut workers = self.workers.write().await;
+            if let Some(tx) = workers.remove(uaid) {
+                let _ = tx.send(WorkerCommand::Shutdown).await;
+            }
+        }
+    }
+
+    async fn shutdown_and_delete_worker(&self, uaid: &str) {
         let mut workers = self.workers.write().await;
         if let Some(tx) = workers.remove(uaid) {
             let _ = tx.send(WorkerCommand::Shutdown).await;
@@ -256,7 +291,7 @@ impl AutopushPool {
             pool.run_new_worker(uaid_tx, cmd_rx).await;
         });
 
-        let new_uaid = tokio::time::timeout(Duration::from_secs(15), uaid_rx)
+        let new_uaid = timeout(Duration::from_secs(15), uaid_rx)
             .await
             .map_err(|_| anyhow!("Timed out waiting for new UAID from Autopush"))?
             .map_err(|_| anyhow!("Failed to receive new UAID"))??;
@@ -282,60 +317,70 @@ impl AutopushPool {
             }
         };
 
-        let ws_stream = match connect_async(req).await {
-            Ok((ws, _)) => ws,
-            Err(e) => {
-                let _ = uaid_tx.send(Err(anyhow!("Failed to connect to Autopush WebSocket: {e}")));
-                return;
-            }
-        };
+        let handshake_res = timeout(Duration::from_secs(12), async {
+            let (ws_stream, _) = connect_async(req)
+                .await
+                .map_err(|e| anyhow!("Failed to connect to Autopush WebSocket: {e}"))?;
 
-        let (mut write, mut read) = ws_stream.split();
+            let (mut write, mut read) = ws_stream.split();
 
-        // Send hello without uaid to request a new uaid
-        let hello = HelloMsg {
-            message_type: "hello",
-            use_webpush: true,
-            uaid: None,
-        };
+            // Send hello without uaid to request a new uaid
+            let hello = HelloMsg {
+                message_type: "hello",
+                use_webpush: true,
+                uaid: None,
+            };
 
-        let hello_json = serde_json::to_string(&hello).unwrap();
-        if let Err(e) = write.send(Message::Text(hello_json)).await {
-            let _ = uaid_tx.send(Err(anyhow!("Failed to send hello to Autopush: {e}")));
-            return;
-        }
+            let hello_json = serde_json::to_string(&hello).unwrap();
+            write
+                .send(Message::Text(hello_json))
+                .await
+                .map_err(|e| anyhow!("Failed to send hello to Autopush: {e}"))?;
 
-        // Wait for hello response
-        let mut confirmed_uaid = None;
-        while let Some(msg_res) = read.next().await {
-            match msg_res {
-                Ok(Message::Text(text)) => {
-                    if let Ok(incoming) = serde_json::from_str::<AutopushIncoming>(&text) {
-                        if incoming.message_type == "hello" {
-                            if let Some(uaid) = incoming.uaid {
-                                confirmed_uaid = Some(uaid);
-                                break;
+            // Wait for hello response
+            let mut confirmed_uaid = None;
+            while let Some(msg_res) = read.next().await {
+                match msg_res {
+                    Ok(Message::Text(text)) => {
+                        if let Ok(incoming) = serde_json::from_str::<AutopushIncoming>(&text) {
+                            if incoming.message_type == "hello" {
+                                if let Some(uaid) = incoming.uaid {
+                                    confirmed_uaid = Some(uaid);
+                                    break;
+                                }
                             }
                         }
                     }
+                    Ok(Message::Ping(data)) => {
+                        let _ = write.send(Message::Pong(data)).await;
+                    }
+                    Ok(Message::Close(_)) => {
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(anyhow!("Error reading initial hello from Autopush: {e}"));
+                    }
+                    _ => {}
                 }
-                Ok(Message::Ping(data)) => {
-                    let _ = write.send(Message::Pong(data)).await;
-                }
-                Err(e) => {
-                    let _ = uaid_tx.send(Err(anyhow!(
-                        "Error reading initial hello from Autopush: {e}"
-                    )));
-                    return;
-                }
-                _ => {}
             }
-        }
 
-        let uaid = match confirmed_uaid {
-            Some(u) => u,
-            None => {
-                let _ = uaid_tx.send(Err(anyhow!("Did not receive UAID in hello response")));
+            let uaid =
+                confirmed_uaid.ok_or_else(|| anyhow!("Did not receive UAID in hello response"))?;
+            let ws_stream = write.reunite(read).expect("Reunite ws stream");
+            Ok::<(String, WsStream), anyhow::Error>((uaid, ws_stream))
+        })
+        .await;
+
+        let (uaid, ws_stream) = match handshake_res {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(e)) => {
+                let _ = uaid_tx.send(Err(e));
+                return;
+            }
+            Err(_) => {
+                let _ = uaid_tx.send(Err(anyhow!(
+                    "Timed out during initial Autopush hello handshake"
+                )));
                 return;
             }
         };
@@ -348,7 +393,6 @@ impl AutopushPool {
         let _ = uaid_tx.send(Ok(uaid.clone()));
 
         // Now run normal worker loop
-        let ws_stream = write.reunite(read).expect("Reunite ws stream");
         self.run_worker_loop(uaid, cmd_rx, Some(ws_stream)).await;
     }
 
@@ -391,65 +435,85 @@ impl AutopushPool {
                         }
                     };
 
-                    match connect_async(req).await {
-                        Ok((mut ws, _)) => {
-                            let hello = HelloMsg {
-                                message_type: "hello",
-                                use_webpush: true,
-                                uaid: Some(&uaid),
-                            };
-                            let hello_json = serde_json::to_string(&hello).unwrap();
-                            if let Err(e) = ws.send(Message::Text(hello_json)).await {
-                                warn!("Failed to send hello on reconnect for {uaid}: {e}");
-                                sleep(Duration::from_secs(retry_delay_secs)).await;
-                                retry_delay_secs = (retry_delay_secs * 2).min(60);
-                                continue;
-                            }
+                    let reconnect_res = timeout(Duration::from_secs(12), async {
+                        let (mut ws, _) = connect_async(req).await?;
+                        let hello = HelloMsg {
+                            message_type: "hello",
+                            use_webpush: true,
+                            uaid: Some(&uaid),
+                        };
+                        let hello_json = serde_json::to_string(&hello).unwrap();
+                        ws.send(Message::Text(hello_json)).await?;
 
-                            // Read hello response
-                            let mut uaid_changed = false;
-                            while let Some(msg_res) = ws.next().await {
-                                match msg_res {
-                                    Ok(Message::Text(text)) => {
-                                        if let Ok(incoming) =
-                                            serde_json::from_str::<AutopushIncoming>(&text)
-                                        {
-                                            if incoming.message_type == "hello" {
-                                                if let Some(ref received_uaid) = incoming.uaid {
-                                                    if received_uaid != &uaid {
-                                                        warn!(
-                                                            "UAID expired on Autopush! Old: {uaid}, New: {received_uaid}"
-                                                        );
-                                                        uaid_changed = true;
-                                                    }
+                        let mut hello_received = false;
+                        let mut uaid_changed = false;
+                        while let Some(msg_res) = ws.next().await {
+                            match msg_res {
+                                Ok(Message::Text(text)) => {
+                                    if let Ok(incoming) =
+                                        serde_json::from_str::<AutopushIncoming>(&text)
+                                    {
+                                        if incoming.message_type == "hello" {
+                                            hello_received = true;
+                                            if let Some(ref received_uaid) = incoming.uaid {
+                                                if received_uaid != &uaid {
+                                                    warn!(
+                                                        "UAID expired on Autopush! Old: {uaid}, New: {received_uaid}"
+                                                    );
+                                                    uaid_changed = true;
                                                 }
-                                                break;
                                             }
+                                            break;
                                         }
                                     }
-                                    Ok(Message::Ping(data)) => {
-                                        let _ = ws.send(Message::Pong(data)).await;
-                                    }
-                                    Err(e) => {
-                                        warn!("Error receiving hello response for {uaid}: {e}");
-                                        break;
-                                    }
-                                    _ => {}
                                 }
+                                Ok(Message::Ping(data)) => {
+                                    let _ = ws.send(Message::Pong(data)).await;
+                                }
+                                Ok(Message::Close(_)) => {
+                                    break;
+                                }
+                                Err(e) => {
+                                    return Err(e);
+                                }
+                                _ => {}
                             }
+                        }
 
+                        Ok::<(WsStream, bool, bool), tokio_tungstenite::tungstenite::Error>((
+                            ws,
+                            hello_received,
+                            uaid_changed,
+                        ))
+                    })
+                    .await;
+
+                    match reconnect_res {
+                        Ok(Ok((ws, hello_received, uaid_changed))) => {
                             if uaid_changed {
                                 // UAID has expired on Autopush side
                                 self.handle_uaid_expired(&uaid).await;
                                 break 'reconnect_loop;
+                            }
+                            if !hello_received {
+                                warn!("Connection closed before receiving hello for {uaid}. Retrying in {retry_delay_secs}s...");
+                                sleep(Duration::from_secs(retry_delay_secs)).await;
+                                retry_delay_secs = (retry_delay_secs * 2).min(60);
+                                continue;
                             }
 
                             let _ = db::touch_session(&self.db_pool, &uaid).await;
                             retry_delay_secs = 2;
                             ws
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             warn!("WebSocket connection failure for {uaid}: {e}. Retrying in {retry_delay_secs}s...");
+                            sleep(Duration::from_secs(retry_delay_secs)).await;
+                            retry_delay_secs = (retry_delay_secs * 2).min(60);
+                            continue;
+                        }
+                        Err(_) => {
+                            warn!("Timed out connecting/handshaking WebSocket for {uaid}. Retrying in {retry_delay_secs}s...");
                             sleep(Duration::from_secs(retry_delay_secs)).await;
                             retry_delay_secs = (retry_delay_secs * 2).min(60);
                             continue;
@@ -460,6 +524,7 @@ impl AutopushPool {
 
             let (mut ws_write, mut ws_read) = ws_stream.split();
             let mut ping_timer = interval(Duration::from_secs(self.config.ws_ping_interval_secs));
+            ping_timer.tick().await; // skip initial immediate tick
 
             'msg_loop: loop {
                 tokio::select! {
@@ -564,6 +629,11 @@ impl AutopushPool {
                 }
             }
 
+            // Fail any in-flight registrations immediately on disconnect rather than waiting for timeout
+            for (_, tx) in pending_registrations.drain() {
+                let _ = tx.send(Err("WebSocket disconnected during registration".to_string()));
+            }
+
             // Msg loop broke: wait and reconnect
             sleep(Duration::from_secs(retry_delay_secs)).await;
             retry_delay_secs = (retry_delay_secs * 2).min(60);
@@ -631,6 +701,7 @@ impl AutopushPool {
             .send_notification(
                 &channel.fcm_token,
                 channel_uuid,
+                msg.version.as_deref(),
                 msg.data.as_deref(),
                 msg.headers.as_ref(),
             )
@@ -675,15 +746,10 @@ impl AutopushPool {
                     let _ = ws_write.send(Message::Text(unreg_json)).await;
                 }
 
-                // Delete channel from DB
+                // Delete channel and clean up session if empty while holding alloc_mutex
+                let _alloc_guard = self.alloc_mutex.lock().await;
                 let _ = db::delete_channel(&self.db_pool, channel_uuid).await;
-
-                // Check remaining
-                if let Ok(count) = db::count_channels_by_uaid(&self.db_pool, uaid).await {
-                    if count == 0 {
-                        self.shutdown_worker(uaid).await;
-                    }
-                }
+                self.shutdown_worker_if_empty(uaid).await;
             }
             Err(e) => {
                 error!("Failed to relay notification to FCM for channel {channel_uuid}: {e}");
@@ -706,7 +772,8 @@ impl AutopushPool {
             }
         }
 
-        self.shutdown_worker(uaid).await;
+        let _alloc_guard = self.alloc_mutex.lock().await;
+        self.shutdown_and_delete_worker(uaid).await;
     }
 
     async fn run_token_sweeper(self: Arc<Self>) {
