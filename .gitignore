@@ -1,0 +1,10 @@
+target/
+.env.local
+.direnv/
+.sqlx/
+*.json
+!Cargo.lock
+!package*.json
+service-account*.json
+firebase-key*.json
+result*
