@@ -15,8 +15,8 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let database_url = env::var("DATABASE_URL")
-            .context("DATABASE_URL environment variable is required")?;
+        let database_url =
+            env::var("DATABASE_URL").context("DATABASE_URL environment variable is required")?;
 
         let host = env::var("HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
         let port = env::var("PORT")
@@ -45,8 +45,9 @@ impl Config {
         let service_account_json = if let Ok(json_str) = env::var("FIREBASE_SERVICE_ACCOUNT_JSON") {
             json_str
         } else if let Ok(path) = env::var("GOOGLE_APPLICATION_CREDENTIALS") {
-            std::fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read service account credentials from {path}"))?
+            std::fs::read_to_string(&path).with_context(|| {
+                format!("Failed to read service account credentials from {path}")
+            })?
         } else {
             anyhow::bail!("Either GOOGLE_APPLICATION_CREDENTIALS or FIREBASE_SERVICE_ACCOUNT_JSON must be set");
         };

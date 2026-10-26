@@ -165,7 +165,9 @@ impl FcmClient {
 
         if !res.status().is_success() {
             let err_body = res.text().await.unwrap_or_default();
-            return Err(FcmError::Auth(format!("OAuth token request failed: {err_body}")));
+            return Err(FcmError::Auth(format!(
+                "OAuth token request failed: {err_body}"
+            )));
         }
 
         let token_resp: GoogleTokenResponse = res.json().await?;
@@ -254,9 +256,7 @@ impl FcmClient {
             message: FcmMessage {
                 token: fcm_token,
                 data,
-                android: FcmAndroidConfig {
-                    priority: "HIGH",
-                },
+                android: FcmAndroidConfig { priority: "HIGH" },
             },
         };
 
@@ -305,6 +305,8 @@ impl FcmClient {
             return Err(FcmError::Unregistered);
         }
 
-        Err(FcmError::Api(format!("FCM request failed {status}: {err_text}")))
+        Err(FcmError::Api(format!(
+            "FCM request failed {status}: {err_text}"
+        )))
     }
 }

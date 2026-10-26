@@ -50,6 +50,7 @@
               pkgs.cargo-watch
               pkgs.nixpkgs-fmt
               pkgs.skopeo
+              pkgs.manifest-tool
             ];
           };
         };

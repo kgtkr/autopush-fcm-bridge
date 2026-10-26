@@ -12,3 +12,12 @@ docker-up:
 
 serve: migrate
     cargo watch -x run
+
+fmt:
+    cargo fmt --check
+
+lint:
+    cargo clippy --all -- -D warnings
+
+test:
+    cargo test

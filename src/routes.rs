@@ -59,7 +59,10 @@ impl IntoResponse for AppError {
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             AppError::Internal(err) => {
                 error!("Internal server error: {err:#}");
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".to_string())
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal server error".to_string(),
+                )
             }
         };
 
@@ -85,7 +88,9 @@ pub fn create_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn healthz(State(state): State<AppState>) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+async fn healthz(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
     sqlx::query("SELECT 1")
         .execute(&state.db)
         .await
@@ -99,10 +104,14 @@ async fn register_channel(
     Json(payload): Json<RegisterChannelRequest>,
 ) -> Result<(StatusCode, Json<RegisterChannelResponse>), AppError> {
     if payload.fcm_token.trim().is_empty() {
-        return Err(AppError::BadRequest("fcm_token cannot be empty".to_string()));
+        return Err(AppError::BadRequest(
+            "fcm_token cannot be empty".to_string(),
+        ));
     }
     if payload.app_server_key.trim().is_empty() {
-        return Err(AppError::BadRequest("app_server_key cannot be empty".to_string()));
+        return Err(AppError::BadRequest(
+            "app_server_key cannot be empty".to_string(),
+        ));
     }
 
     let (channel_id, push_endpoint) = state
@@ -141,7 +150,9 @@ async fn sync_channels(
     Json(payload): Json<SyncChannelsRequest>,
 ) -> Result<Json<SyncChannelsResponse>, AppError> {
     if payload.fcm_token.trim().is_empty() {
-        return Err(AppError::BadRequest("fcm_token cannot be empty".to_string()));
+        return Err(AppError::BadRequest(
+            "fcm_token cannot be empty".to_string(),
+        ));
     }
 
     let (active_channel_ids, expired_channel_ids) = state

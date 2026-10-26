@@ -1,11 +1,7 @@
 use anyhow::{anyhow, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     sync::{mpsc, oneshot, RwLock},
     time::{interval, sleep},
@@ -20,7 +16,7 @@ use uuid::Uuid;
 use crate::{
     config::Config,
     db,
-    fcm::{FcmError, FcmClient},
+    fcm::{FcmClient, FcmError},
 };
 
 type WsStream =
@@ -103,11 +99,7 @@ pub struct AutopushPool {
 }
 
 impl AutopushPool {
-    pub fn new(
-        config: Arc<Config>,
-        db_pool: sqlx::PgPool,
-        fcm_client: Arc<FcmClient>,
-    ) -> Self {
+    pub fn new(config: Arc<Config>, db_pool: sqlx::PgPool, fcm_client: Arc<FcmClient>) -> Self {
         Self {
             config,
             db_pool,
@@ -158,8 +150,8 @@ impl AutopushPool {
             .map_err(|e| anyhow!("FCM token validation failed: {e}"))?;
 
         // 2. Find candidate UAID or spawn new one
-        let mut target_uaid = db::find_candidate_uaid(&self.db_pool, self.config.max_channels_per_uaid)
-            .await?;
+        let mut target_uaid =
+            db::find_candidate_uaid(&self.db_pool, self.config.max_channels_per_uaid).await?;
 
         let mut worker_tx = None;
         if let Some(ref uaid) = target_uaid {
@@ -209,9 +201,7 @@ impl AutopushPool {
         )
         .await?;
 
-        info!(
-            "Registered channel {channel_id} on UAID {uaid} (pushEndpoint: {push_endpoint})"
-        );
+        info!("Registered channel {channel_id} on UAID {uaid} (pushEndpoint: {push_endpoint})");
 
         Ok((channel_id, push_endpoint))
     }
@@ -271,7 +261,10 @@ impl AutopushPool {
             .map_err(|_| anyhow!("Timed out waiting for new UAID from Autopush"))?
             .map_err(|_| anyhow!("Failed to receive new UAID"))??;
 
-        self.workers.write().await.insert(new_uaid.clone(), cmd_tx.clone());
+        self.workers
+            .write()
+            .await
+            .insert(new_uaid.clone(), cmd_tx.clone());
         Ok((new_uaid, cmd_tx))
     }
 
@@ -330,7 +323,9 @@ impl AutopushPool {
                     let _ = write.send(Message::Pong(data)).await;
                 }
                 Err(e) => {
-                    let _ = uaid_tx.send(Err(anyhow!("Error reading initial hello from Autopush: {e}")));
+                    let _ = uaid_tx.send(Err(anyhow!(
+                        "Error reading initial hello from Autopush: {e}"
+                    )));
                     return;
                 }
                 _ => {}
@@ -416,7 +411,9 @@ impl AutopushPool {
                             while let Some(msg_res) = ws.next().await {
                                 match msg_res {
                                     Ok(Message::Text(text)) => {
-                                        if let Ok(incoming) = serde_json::from_str::<AutopushIncoming>(&text) {
+                                        if let Ok(incoming) =
+                                            serde_json::from_str::<AutopushIncoming>(&text)
+                                        {
                                             if incoming.message_type == "hello" {
                                                 if let Some(ref received_uaid) = incoming.uaid {
                                                     if received_uaid != &uaid {
@@ -698,7 +695,10 @@ impl AutopushPool {
         info!("Handling expired UAID {uaid}: notifying channels and cleaning up DB");
         if let Ok(channels) = db::get_channels_by_uaid(&self.db_pool, uaid).await {
             for ch in channels {
-                info!("Sending channel_expired message to FCM token for channel {}", ch.channel_id);
+                info!(
+                    "Sending channel_expired message to FCM token for channel {}",
+                    ch.channel_id
+                );
                 let _ = self
                     .fcm_client
                     .send_channel_expired(&ch.fcm_token, ch.channel_id)
@@ -737,7 +737,9 @@ impl AutopushPool {
                     }
                     Err(FcmError::Unregistered) => {
                         warn!("Sweeper found unregistered FCM token. Cleaning up associated channels...");
-                        if let Ok(channels) = db::get_channels_by_fcm_token(&self.db_pool, &token).await {
+                        if let Ok(channels) =
+                            db::get_channels_by_fcm_token(&self.db_pool, &token).await
+                        {
                             for ch in channels {
                                 let _ = self.unregister_channel(ch.channel_id).await;
                             }
