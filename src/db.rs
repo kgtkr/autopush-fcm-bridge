@@ -10,7 +10,7 @@ pub struct AutopushSession {
     pub last_connected_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Channel {
     pub channel_id: Uuid,
     pub uaid: String,
@@ -19,6 +19,20 @@ pub struct Channel {
     pub push_endpoint: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for Channel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Channel")
+            .field("channel_id", &self.channel_id)
+            .field("uaid", &self.uaid)
+            .field("fcm_token", &"<redacted>")
+            .field("app_server_key", &"<redacted>")
+            .field("push_endpoint", &"<redacted>")
+            .field("created_at", &self.created_at)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
 }
 
 pub async fn create_pool(database_url: &str) -> Result<PgPool> {

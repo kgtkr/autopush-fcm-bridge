@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::env;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub database_url: String,
     pub host: String,
@@ -11,6 +11,21 @@ pub struct Config {
     pub ws_ping_interval_secs: u64,
     pub token_sweep_interval_secs: u64,
     pub service_account_json: String,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("database_url", &"<redacted>")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("autopush_ws_url", &self.autopush_ws_url)
+            .field("max_channels_per_uaid", &self.max_channels_per_uaid)
+            .field("ws_ping_interval_secs", &self.ws_ping_interval_secs)
+            .field("token_sweep_interval_secs", &self.token_sweep_interval_secs)
+            .field("service_account_json", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Config {

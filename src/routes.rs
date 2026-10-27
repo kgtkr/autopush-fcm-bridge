@@ -10,7 +10,11 @@ use std::sync::Arc;
 use tracing::error;
 use uuid::Uuid;
 
-use crate::pool::AutopushPool;
+use crate::pool::{AutopushPool, ChannelError};
+
+const MAX_FCM_TOKEN_LEN: usize = 4096;
+const MAX_APP_SERVER_KEY_LEN: usize = 255;
+const MAX_SYNC_CHANNEL_IDS: usize = 100;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -70,12 +74,20 @@ impl IntoResponse for AppError {
     }
 }
 
-impl<E> From<E> for AppError
-where
-    E: Into<anyhow::Error>,
-{
-    fn from(err: E) -> Self {
-        AppError::Internal(err.into())
+impl From<ChannelError> for AppError {
+    fn from(err: ChannelError) -> Self {
+        match err {
+            ChannelError::InvalidFcmToken => {
+                AppError::BadRequest("Invalid or unregistered FCM token".to_string())
+            }
+            ChannelError::Internal(err) => AppError::Internal(err),
+        }
+    }
+}
+
+impl From<anyhow::Error> for AppError {
+    fn from(err: anyhow::Error) -> Self {
+        AppError::Internal(err)
     }
 }
 
@@ -102,36 +114,41 @@ async fn register_channel(
     State(state): State<AppState>,
     Json(payload): Json<RegisterChannelRequest>,
 ) -> Result<(StatusCode, Json<RegisterChannelResponse>), AppError> {
-    if payload.fcm_token.trim().is_empty() {
+    let fcm_token = payload.fcm_token.trim();
+    if fcm_token.is_empty() {
         return Err(AppError::BadRequest(
             "fcm_token cannot be empty".to_string(),
         ));
     }
-    if payload.app_server_key.trim().is_empty() {
+    if fcm_token.len() > MAX_FCM_TOKEN_LEN {
+        return Err(AppError::BadRequest(format!(
+            "fcm_token is too long (max {MAX_FCM_TOKEN_LEN} characters)"
+        )));
+    }
+
+    let app_server_key = payload.app_server_key.trim();
+    if app_server_key.is_empty() {
         return Err(AppError::BadRequest(
             "app_server_key cannot be empty".to_string(),
         ));
     }
+    if app_server_key.len() > MAX_APP_SERVER_KEY_LEN {
+        return Err(AppError::BadRequest(format!(
+            "app_server_key is too long (max {MAX_APP_SERVER_KEY_LEN} characters)"
+        )));
+    }
 
     let (channel_id, push_endpoint) = state
         .pool
-        .register_channel(&payload.fcm_token, &payload.app_server_key)
-        .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("FCM token validation failed") {
-                AppError::BadRequest(msg)
-            } else {
-                AppError::Internal(e)
-            }
-        })?;
+        .register_channel(fcm_token, app_server_key)
+        .await?;
 
     Ok((
         StatusCode::CREATED,
         Json(RegisterChannelResponse {
             channel_id,
             push_endpoint,
-            app_server_key: payload.app_server_key,
+            app_server_key: app_server_key.to_string(),
         }),
     ))
 }
@@ -148,24 +165,27 @@ async fn sync_channels(
     State(state): State<AppState>,
     Json(payload): Json<SyncChannelsRequest>,
 ) -> Result<Json<SyncChannelsResponse>, AppError> {
-    if payload.fcm_token.trim().is_empty() {
+    let fcm_token = payload.fcm_token.trim();
+    if fcm_token.is_empty() {
         return Err(AppError::BadRequest(
             "fcm_token cannot be empty".to_string(),
         ));
     }
+    if fcm_token.len() > MAX_FCM_TOKEN_LEN {
+        return Err(AppError::BadRequest(format!(
+            "fcm_token is too long (max {MAX_FCM_TOKEN_LEN} characters)"
+        )));
+    }
+    if payload.channel_ids.len() > MAX_SYNC_CHANNEL_IDS {
+        return Err(AppError::BadRequest(format!(
+            "Too many channel_ids (max {MAX_SYNC_CHANNEL_IDS})"
+        )));
+    }
 
     let (active_channel_ids, expired_channel_ids) = state
         .pool
-        .sync_channels(&payload.fcm_token, &payload.channel_ids)
-        .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("FCM token validation failed") {
-                AppError::BadRequest(msg)
-            } else {
-                AppError::Internal(e)
-            }
-        })?;
+        .sync_channels(fcm_token, &payload.channel_ids)
+        .await?;
 
     Ok(Json(SyncChannelsResponse {
         active_channel_ids,

@@ -8,3 +8,4 @@ target/
 service-account*.json
 firebase-key*.json
 result*
+plan*.md

@@ -79,6 +79,14 @@ struct AckMsg<'a> {
     updates: Vec<AckUpdate<'a>>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ChannelError {
+    #[error("Invalid or unregistered FCM token")]
+    InvalidFcmToken,
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
 pub enum WorkerCommand {
     Register {
         channel_id: Uuid,
@@ -155,12 +163,16 @@ impl AutopushPool {
         self: &Arc<Self>,
         fcm_token: &str,
         app_server_key: &str,
-    ) -> Result<(Uuid, String)> {
+    ) -> Result<(Uuid, String), ChannelError> {
         // 1. Verify FCM token (validate_only: true)
-        self.fcm_client
-            .validate_token(fcm_token)
-            .await
-            .map_err(|e| anyhow!("FCM token validation failed: {e}"))?;
+        if let Err(e) = self.fcm_client.validate_token(fcm_token).await {
+            return match e {
+                FcmError::Unregistered => Err(ChannelError::InvalidFcmToken),
+                other => Err(ChannelError::Internal(anyhow!(
+                    "FCM token validation failed: {other}"
+                ))),
+            };
+        }
 
         // Serialize session candidate selection, registration, and channel DB insertion
         // to avoid race conditions with concurrent registrations or empty-session cleanup.
@@ -201,7 +213,7 @@ impl AutopushPool {
         .await
         .map_err(|_| anyhow!("Failed to send register command to worker for UAID {uaid}"))?;
 
-        let reg_res = timeout(Duration::from_secs(15), resp_rx)
+        let reg_res = timeout(Duration::from_secs(5), resp_rx)
             .await
             .map_err(|_| anyhow!("Timed out waiting for Autopush registration"))
             .and_then(|r| r.map_err(|_| anyhow!("Worker dropped response channel")))
@@ -212,12 +224,12 @@ impl AutopushPool {
             Err(e) => {
                 // If this was a newly created session with 0 channels and registration failed, clean it up
                 self.shutdown_worker_if_empty(&uaid).await;
-                return Err(e);
+                return Err(ChannelError::Internal(e));
             }
         };
 
         // 4. Save to DB
-        db::insert_channel(
+        if let Err(e) = db::insert_channel(
             &self.db_pool,
             channel_id,
             &uaid,
@@ -225,9 +237,14 @@ impl AutopushPool {
             app_server_key,
             &push_endpoint,
         )
-        .await?;
+        .await
+        {
+            let _ = tx.send(WorkerCommand::Unregister { channel_id }).await;
+            self.shutdown_worker_if_empty(&uaid).await;
+            return Err(ChannelError::Internal(e));
+        }
 
-        info!("Registered channel {channel_id} on UAID {uaid} (pushEndpoint: {push_endpoint})");
+        info!("Registered channel {channel_id} on UAID {uaid}");
 
         Ok((channel_id, push_endpoint))
     }
@@ -254,14 +271,20 @@ impl AutopushPool {
         &self,
         fcm_token: &str,
         channel_ids: &[Uuid],
-    ) -> Result<(Vec<Uuid>, Vec<Uuid>)> {
+    ) -> Result<(Vec<Uuid>, Vec<Uuid>), ChannelError> {
         // Validate FCM token
-        self.fcm_client
-            .validate_token(fcm_token)
-            .await
-            .map_err(|e| anyhow!("FCM token validation failed: {e}"))?;
+        if let Err(e) = self.fcm_client.validate_token(fcm_token).await {
+            return match e {
+                FcmError::Unregistered => Err(ChannelError::InvalidFcmToken),
+                other => Err(ChannelError::Internal(anyhow!(
+                    "FCM token validation failed: {other}"
+                ))),
+            };
+        }
 
-        db::sync_channels(&self.db_pool, fcm_token, channel_ids).await
+        db::sync_channels(&self.db_pool, fcm_token, channel_ids)
+            .await
+            .map_err(ChannelError::Internal)
     }
 
     async fn shutdown_worker_if_empty(&self, uaid: &str) {
@@ -291,7 +314,7 @@ impl AutopushPool {
             pool.run_new_worker(uaid_tx, cmd_rx).await;
         });
 
-        let new_uaid = timeout(Duration::from_secs(15), uaid_rx)
+        let new_uaid = timeout(Duration::from_secs(8), uaid_rx)
             .await
             .map_err(|_| anyhow!("Timed out waiting for new UAID from Autopush"))?
             .map_err(|_| anyhow!("Failed to receive new UAID"))??;
@@ -317,7 +340,7 @@ impl AutopushPool {
             }
         };
 
-        let handshake_res = timeout(Duration::from_secs(12), async {
+        let handshake_res = timeout(Duration::from_secs(5), async {
             let (ws_stream, _) = connect_async(req)
                 .await
                 .map_err(|e| anyhow!("Failed to connect to Autopush WebSocket: {e}"))?;
@@ -390,7 +413,10 @@ impl AutopushPool {
             return;
         }
 
-        let _ = uaid_tx.send(Ok(uaid.clone()));
+        if uaid_tx.send(Ok(uaid.clone())).is_err() {
+            let _ = db::delete_session(&self.db_pool, &uaid).await;
+            return;
+        }
 
         // Now run normal worker loop
         self.run_worker_loop(uaid, cmd_rx, Some(ws_stream)).await;
@@ -562,7 +588,7 @@ impl AutopushPool {
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("Failed to parse incoming Autopush JSON: {e}; text: {text}");
+                                        warn!("Failed to parse incoming Autopush JSON: {e}");
                                     }
                                 }
                             }
