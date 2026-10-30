@@ -163,6 +163,7 @@ impl AutopushPool {
         self: &Arc<Self>,
         fcm_token: &str,
         app_server_key: &str,
+        requested_channel_id: Option<Uuid>,
     ) -> Result<(Uuid, String), ChannelError> {
         // 1. Verify FCM token (validate_only: true)
         if let Err(e) = self.fcm_client.validate_token(fcm_token).await {
@@ -177,6 +178,24 @@ impl AutopushPool {
         // Serialize session candidate selection, registration, and channel DB insertion
         // to avoid race conditions with concurrent registrations or empty-session cleanup.
         let _alloc_guard = self.alloc_mutex.lock().await;
+
+        let mut old_autopush_to_cleanup: Option<(String, Uuid)> = None;
+
+        if let Some(existing_cid) = requested_channel_id {
+            if let Some(existing_channel) = db::get_channel(&self.db_pool, existing_cid).await? {
+                if existing_channel.app_server_key == app_server_key {
+                    db::upsert_channel_fcm_token(&self.db_pool, existing_cid, fcm_token).await?;
+                    info!(
+                        "Reused existing channel {existing_cid} (autopush {}) on UAID {}",
+                        existing_channel.autopush_channel_id, existing_channel.uaid
+                    );
+                    return Ok((existing_cid, existing_channel.push_endpoint));
+                } else {
+                    old_autopush_to_cleanup =
+                        Some((existing_channel.uaid, existing_channel.autopush_channel_id));
+                }
+            }
+        }
 
         // 2. Find candidate UAID or spawn new one
         let mut target_uaid =
@@ -202,11 +221,16 @@ impl AutopushPool {
         };
 
         // 3. Register channel on the worker
-        let channel_id = Uuid::new_v4();
+        let channel_id = requested_channel_id.unwrap_or_else(Uuid::new_v4);
+        let autopush_channel_id = if requested_channel_id.is_some() {
+            Uuid::new_v4()
+        } else {
+            channel_id
+        };
         let (resp_tx, resp_rx) = oneshot::channel();
 
         tx.send(WorkerCommand::Register {
-            channel_id,
+            channel_id: autopush_channel_id,
             app_server_key: app_server_key.to_string(),
             resp_tx,
         })
@@ -229,9 +253,10 @@ impl AutopushPool {
         };
 
         // 4. Save to DB
-        if let Err(e) = db::insert_channel(
+        if let Err(e) = db::upsert_channel(
             &self.db_pool,
             channel_id,
+            autopush_channel_id,
             &uaid,
             fcm_token,
             app_server_key,
@@ -239,25 +264,54 @@ impl AutopushPool {
         )
         .await
         {
-            let _ = tx.send(WorkerCommand::Unregister { channel_id }).await;
+            let _ = tx
+                .send(WorkerCommand::Unregister {
+                    channel_id: autopush_channel_id,
+                })
+                .await;
             self.shutdown_worker_if_empty(&uaid).await;
             return Err(ChannelError::Internal(e));
         }
 
-        info!("Registered channel {channel_id} on UAID {uaid}");
+        if let Some((old_uaid, old_autopush_cid)) = old_autopush_to_cleanup {
+            let workers = self.workers.read().await;
+            if let Some(old_tx) = workers.get(&old_uaid) {
+                let _ = old_tx
+                    .send(WorkerCommand::Unregister {
+                        channel_id: old_autopush_cid,
+                    })
+                    .await;
+            }
+            drop(workers);
+            self.shutdown_worker_if_empty(&old_uaid).await;
+        }
+
+        info!("Registered channel {channel_id} (autopush {autopush_channel_id}) on UAID {uaid}");
 
         Ok((channel_id, push_endpoint))
     }
 
-    pub async fn unregister_channel(&self, channel_id: Uuid) -> Result<()> {
+    pub async fn unregister_channel(
+        &self,
+        channel_id: Uuid,
+        fcm_token: Option<&str>,
+    ) -> Result<()> {
         let _alloc_guard = self.alloc_mutex.lock().await;
 
-        let uaid_opt = db::delete_channel(&self.db_pool, channel_id).await?;
-        if let Some(uaid) = uaid_opt {
+        let deleted_opt = match fcm_token.map(str::trim).filter(|t| !t.is_empty()) {
+            Some(token) => db::remove_channel_fcm_token(&self.db_pool, channel_id, token).await?,
+            None => db::delete_channel(&self.db_pool, channel_id).await?,
+        };
+
+        if let Some((uaid, autopush_channel_id)) = deleted_opt {
             {
                 let workers = self.workers.read().await;
                 if let Some(tx) = workers.get(&uaid) {
-                    let _ = tx.send(WorkerCommand::Unregister { channel_id }).await;
+                    let _ = tx
+                        .send(WorkerCommand::Unregister {
+                            channel_id: autopush_channel_id,
+                        })
+                        .await;
                 }
             }
 
@@ -271,7 +325,7 @@ impl AutopushPool {
         &self,
         fcm_token: &str,
         channel_ids: &[Uuid],
-    ) -> Result<(Vec<Uuid>, Vec<Uuid>), ChannelError> {
+    ) -> Result<(Vec<Uuid>, Vec<Uuid>, HashMap<Uuid, String>), ChannelError> {
         // Validate FCM token
         if let Err(e) = self.fcm_client.validate_token(fcm_token).await {
             return match e {
@@ -678,26 +732,30 @@ impl AutopushPool {
         msg: AutopushIncoming,
         ws_write: &mut WsSink,
     ) {
-        let channel_id_str = match msg.channel_id {
+        let autopush_channel_id_str = match msg.channel_id {
             Some(ref id) => id.clone(),
             None => return,
         };
 
-        let channel_uuid = match Uuid::parse_str(&channel_id_str) {
+        let autopush_channel_uuid = match Uuid::parse_str(&autopush_channel_id_str) {
             Ok(uuid) => uuid,
             Err(_) => return,
         };
 
-        let channel = match db::get_channel(&self.db_pool, channel_uuid).await {
+        let channel = match db::get_channel_by_autopush_id(&self.db_pool, autopush_channel_uuid)
+            .await
+        {
             Ok(Some(ch)) => ch,
             Ok(None) => {
-                warn!("Received notification for unknown channel {channel_id_str}");
+                warn!(
+                    "Received notification for unknown autopush channel {autopush_channel_id_str}"
+                );
                 // Send unregister and ack
                 if let Some(ref version) = msg.version {
                     let ack = AckMsg {
                         message_type: "ack",
                         updates: vec![AckUpdate {
-                            channel_id: &channel_id_str,
+                            channel_id: &autopush_channel_id_str,
                             version,
                         }],
                     };
@@ -707,7 +765,7 @@ impl AutopushPool {
                 }
                 let unreg = UnregisterMsg {
                     message_type: "unregister",
-                    channel_id: &channel_id_str,
+                    channel_id: &autopush_channel_id_str,
                 };
                 if let Ok(unreg_json) = serde_json::to_string(&unreg) {
                     let _ = ws_write.send(Message::Text(unreg_json)).await;
@@ -715,70 +773,128 @@ impl AutopushPool {
                 return;
             }
             Err(e) => {
-                error!("Database error looking up channel {channel_id_str}: {e}");
+                error!("Database error looking up autopush channel {autopush_channel_id_str}: {e}");
                 return;
             }
         };
 
-        info!("Relaying notification for channel {channel_uuid} to FCM...");
-
-        let send_res = self
-            .fcm_client
-            .send_notification(
-                &channel.fcm_token,
-                channel_uuid,
-                msg.version.as_deref(),
-                msg.data.as_deref(),
-                msg.headers.as_ref(),
-            )
-            .await;
-
-        match send_res {
-            Ok(()) => {
-                info!("FCM notification sent successfully for channel {channel_uuid}. Sending ACK to Autopush.");
-                if let Some(ref version) = msg.version {
-                    let ack = AckMsg {
-                        message_type: "ack",
-                        updates: vec![AckUpdate {
-                            channel_id: &channel_id_str,
-                            version,
-                        }],
-                    };
-                    if let Ok(ack_json) = serde_json::to_string(&ack) {
-                        let _ = ws_write.send(Message::Text(ack_json)).await;
-                    }
-                }
-            }
-            Err(FcmError::Unregistered) => {
-                warn!("FCM token for channel {channel_uuid} is unregistered. Cleaning up channel.");
-                // Send ACK and unregister
-                if let Some(ref version) = msg.version {
-                    let ack = AckMsg {
-                        message_type: "ack",
-                        updates: vec![AckUpdate {
-                            channel_id: &channel_id_str,
-                            version,
-                        }],
-                    };
-                    if let Ok(ack_json) = serde_json::to_string(&ack) {
-                        let _ = ws_write.send(Message::Text(ack_json)).await;
-                    }
-                }
-                let unreg = UnregisterMsg {
-                    message_type: "unregister",
-                    channel_id: &channel_id_str,
-                };
-                if let Ok(unreg_json) = serde_json::to_string(&unreg) {
-                    let _ = ws_write.send(Message::Text(unreg_json)).await;
-                }
-
-                // Delete channel and clean up session if empty while holding alloc_mutex
-                let _alloc_guard = self.alloc_mutex.lock().await;
-                let _ = db::delete_channel(&self.db_pool, channel_uuid).await;
-                self.shutdown_worker_if_empty(uaid).await;
-            }
+        let channel_uuid = channel.channel_id;
+        let fcm_tokens = match db::get_fcm_tokens_by_channel(&self.db_pool, channel_uuid).await {
+            Ok(tokens) => tokens,
             Err(e) => {
-                error!("Failed to relay notification to FCM for channel {channel_uuid}: {e}");
+                error!("Database error looking up FCM tokens for channel {channel_uuid}: {e}");
+                return;
+            }
+        };
+
+        if fcm_tokens.is_empty() {
+            warn!("Channel {channel_uuid} has no registered FCM tokens. Cleaning up.");
+            if let Some(ref version) = msg.version {
+                let ack = AckMsg {
+                    message_type: "ack",
+                    updates: vec![AckUpdate {
+                        channel_id: &autopush_channel_id_str,
+                        version,
+                    }],
+                };
+                if let Ok(ack_json) = serde_json::to_string(&ack) {
+                    let _ = ws_write.send(Message::Text(ack_json)).await;
+                }
+            }
+            let unreg = UnregisterMsg {
+                message_type: "unregister",
+                channel_id: &autopush_channel_id_str,
+            };
+            if let Ok(unreg_json) = serde_json::to_string(&unreg) {
+                let _ = ws_write.send(Message::Text(unreg_json)).await;
+            }
+            let _alloc_guard = self.alloc_mutex.lock().await;
+            let _ = db::delete_channel(&self.db_pool, channel_uuid).await;
+            self.shutdown_worker_if_empty(uaid).await;
+            return;
+        }
+
+        info!(
+            "Relaying notification for channel {channel_uuid} to {} FCM token(s)...",
+            fcm_tokens.len()
+        );
+
+        let mut any_success = false;
+        let mut unregistered_tokens = Vec::new();
+
+        for token in &fcm_tokens {
+            let send_res = self
+                .fcm_client
+                .send_notification(
+                    token,
+                    channel_uuid,
+                    msg.version.as_deref(),
+                    msg.data.as_deref(),
+                    msg.headers.as_ref(),
+                )
+                .await;
+
+            match send_res {
+                Ok(()) => {
+                    any_success = true;
+                }
+                Err(FcmError::Unregistered) => {
+                    warn!("FCM token for channel {channel_uuid} is unregistered. Queuing token cleanup.");
+                    unregistered_tokens.push(token.clone());
+                }
+                Err(e) => {
+                    error!("Failed to relay notification to an FCM token for channel {channel_uuid}: {e}");
+                }
+            }
+        }
+
+        if any_success {
+            info!("FCM notification sent successfully for channel {channel_uuid}. Sending ACK to Autopush.");
+            if let Some(ref version) = msg.version {
+                let ack = AckMsg {
+                    message_type: "ack",
+                    updates: vec![AckUpdate {
+                        channel_id: &autopush_channel_id_str,
+                        version,
+                    }],
+                };
+                if let Ok(ack_json) = serde_json::to_string(&ack) {
+                    let _ = ws_write.send(Message::Text(ack_json)).await;
+                }
+            }
+        }
+
+        if !unregistered_tokens.is_empty() {
+            let _alloc_guard = self.alloc_mutex.lock().await;
+            for bad_token in unregistered_tokens {
+                if let Ok(Some((_deleted_uaid, deleted_autopush_cid))) =
+                    db::remove_channel_fcm_token(&self.db_pool, channel_uuid, &bad_token).await
+                {
+                    warn!("All FCM tokens for channel {channel_uuid} are unregistered. Unregistering Autopush channel {deleted_autopush_cid}.");
+                    if !any_success {
+                        if let Some(ref version) = msg.version {
+                            let ack = AckMsg {
+                                message_type: "ack",
+                                updates: vec![AckUpdate {
+                                    channel_id: &autopush_channel_id_str,
+                                    version,
+                                }],
+                            };
+                            if let Ok(ack_json) = serde_json::to_string(&ack) {
+                                let _ = ws_write.send(Message::Text(ack_json)).await;
+                            }
+                        }
+                    }
+                    let cid_str = deleted_autopush_cid.to_string();
+                    let unreg = UnregisterMsg {
+                        message_type: "unregister",
+                        channel_id: &cid_str,
+                    };
+                    if let Ok(unreg_json) = serde_json::to_string(&unreg) {
+                        let _ = ws_write.send(Message::Text(unreg_json)).await;
+                    }
+                    self.shutdown_worker_if_empty(uaid).await;
+                }
             }
         }
     }
@@ -787,14 +903,20 @@ impl AutopushPool {
         info!("Handling expired UAID {uaid}: notifying channels and cleaning up DB");
         if let Ok(channels) = db::get_channels_by_uaid(&self.db_pool, uaid).await {
             for ch in channels {
-                info!(
-                    "Sending channel_expired message to FCM token for channel {}",
-                    ch.channel_id
-                );
-                let _ = self
-                    .fcm_client
-                    .send_channel_expired(&ch.fcm_token, ch.channel_id)
-                    .await;
+                if let Ok(tokens) =
+                    db::get_fcm_tokens_by_channel(&self.db_pool, ch.channel_id).await
+                {
+                    for token in tokens {
+                        info!(
+                            "Sending channel_expired message to FCM token for channel {}",
+                            ch.channel_id
+                        );
+                        let _ = self
+                            .fcm_client
+                            .send_channel_expired(&token, ch.channel_id)
+                            .await;
+                    }
+                }
             }
         }
 
@@ -829,12 +951,12 @@ impl AutopushPool {
                         // Token is still valid
                     }
                     Err(FcmError::Unregistered) => {
-                        warn!("Sweeper found unregistered FCM token. Cleaning up associated channels...");
-                        if let Ok(channels) =
-                            db::get_channels_by_fcm_token(&self.db_pool, &token).await
+                        warn!("Sweeper found unregistered FCM token. Cleaning up associated channel bindings...");
+                        if let Ok(channel_ids) =
+                            db::get_channel_ids_by_fcm_token(&self.db_pool, &token).await
                         {
-                            for ch in channels {
-                                let _ = self.unregister_channel(ch.channel_id).await;
+                            for channel_id in channel_ids {
+                                let _ = self.unregister_channel(channel_id, Some(&token)).await;
                             }
                         }
                     }

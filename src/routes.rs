@@ -1,12 +1,12 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tracing::error;
 use uuid::Uuid;
 
@@ -26,6 +26,8 @@ pub struct AppState {
 pub struct RegisterChannelRequest {
     pub fcm_token: String,
     pub app_server_key: String,
+    #[serde(default)]
+    pub channel_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -33,6 +35,12 @@ pub struct RegisterChannelResponse {
     pub channel_id: Uuid,
     pub push_endpoint: String,
     pub app_server_key: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct UnregisterChannelQuery {
+    #[serde(default)]
+    pub fcm_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,6 +53,7 @@ pub struct SyncChannelsRequest {
 pub struct SyncChannelsResponse {
     pub active_channel_ids: Vec<Uuid>,
     pub expired_channel_ids: Vec<Uuid>,
+    pub channel_endpoints: HashMap<Uuid, String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,7 +149,7 @@ async fn register_channel(
 
     let (channel_id, push_endpoint) = state
         .pool
-        .register_channel(fcm_token, app_server_key)
+        .register_channel(fcm_token, app_server_key, payload.channel_id)
         .await?;
 
     Ok((
@@ -156,8 +165,19 @@ async fn register_channel(
 async fn unregister_channel(
     State(state): State<AppState>,
     Path(channel_id): Path<Uuid>,
+    Query(query): Query<UnregisterChannelQuery>,
 ) -> Result<StatusCode, AppError> {
-    state.pool.unregister_channel(channel_id).await?;
+    if let Some(ref token) = query.fcm_token {
+        if token.len() > MAX_FCM_TOKEN_LEN {
+            return Err(AppError::BadRequest(format!(
+                "fcm_token is too long (max {MAX_FCM_TOKEN_LEN} characters)"
+            )));
+        }
+    }
+    state
+        .pool
+        .unregister_channel(channel_id, query.fcm_token.as_deref())
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -182,7 +202,7 @@ async fn sync_channels(
         )));
     }
 
-    let (active_channel_ids, expired_channel_ids) = state
+    let (active_channel_ids, expired_channel_ids, channel_endpoints) = state
         .pool
         .sync_channels(fcm_token, &payload.channel_ids)
         .await?;
@@ -190,5 +210,6 @@ async fn sync_channels(
     Ok(Json(SyncChannelsResponse {
         active_channel_ids,
         expired_channel_ids,
+        channel_endpoints,
     }))
 }
