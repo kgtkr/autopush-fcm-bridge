@@ -12,14 +12,14 @@ runs:
         echo "BASH_ENV=$PWD/result-devShell.sh" >> $GITHUB_ENV
       shell: bash
     - name: Cache cargo target
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ./target
         key: cargo-cache-20261026-1-${{ github.sha }}
         restore-keys: |
           cargo-cache-20261026-1-
     - name: Cache cargo home
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ~/.cargo
         key: cargo-home-20261026-1-${{ github.sha }}
